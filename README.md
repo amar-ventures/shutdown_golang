@@ -13,6 +13,9 @@ This project is a Go-based daemon that interacts with a Supabase database to man
 - **Row-Level Security (RLS)**: Adheres to Supabase's RLS policies for secure database access.
 - **Cross-Platform Support**: Supports both Linux and Windows with platform-specific binaries and startup scripts.
 
+## Access frontend at
+- https://shutdown-ts.vercel.app/
+
 ## Prerequisites
 
 - Go 1.20 or later installed on your system.

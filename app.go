@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"runtime"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -257,7 +258,18 @@ func handleShutdown(userID, name string, dev *Device, req map[string]interface{}
 	patchDevice(userID, name, map[string]interface{}{"shutdown_requested": map[string]string{"status": "done"}})
 	log.Println("Shutting down…")
 	time.Sleep(ShutdownDelay)
-	exec.Command("shutdown", "now").Run()
+
+	// Execute shutdown command based on the OS
+	switch os := runtime.GOOS; os {
+	case "windows":
+		exec.Command("shutdown", "/s", "/t", "0").Run() // Windows shutdown
+	case "linux":
+		exec.Command("shutdown", "now").Run() // Linux shutdown
+	case "darwin":
+		exec.Command("osascript", "-e", "tell application \"System Events\" to shut down").Run() // macOS shutdown
+	default:
+		log.Printf("Unsupported OS: %s. Shutdown command not executed.", os)
+	}
 }
 
 // getHostname wraps os.Hostname
