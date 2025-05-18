@@ -20,6 +20,8 @@ const (
 	StatusUpdateInterval     = 3 * time.Minute
 	ShutdownPollInterval     = 10 * time.Second
 	MinUptimeBeforeShutdown  = 1 * time.Minute
+	MaxRetries                = 3
+	RetryDelay                = 5 * time.Second
 )
 
 type AuthResponse struct {
@@ -30,10 +32,11 @@ type AuthResponse struct {
 	} `json:"user"`
 }
 
+// Update the Device struct to properly handle ISO timestamps
 type Device struct {
 	ID              string          `json:"id"`
 	UserID          string          `json:"user_id"`
-	Name            string          `json:"name"`
+	Name            string          `json:"name"` 
 	Status          string          `json:"status"`
 	LastSeen        *time.Time      `json:"last_seen"`
 	FirstOnlineAt   *time.Time      `json:"first_online_at"`
@@ -48,28 +51,62 @@ var (
 )
 
 func main() {
-	if err := godotenv.Load(); err != nil {
-		log.Fatal("Error loading .env file:", err)
+	// Set up logging to include timestamps
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
+	for {
+		if err := run(); err != nil {
+			log.Printf("Application error: %v", err)
+			log.Printf("Waiting 30 seconds before retrying...")
+			time.Sleep(30 * time.Second)
+			continue
+		}
 	}
+}
+
+func run() error {
+	if err := godotenv.Load(); err != nil {
+		return fmt.Errorf("error loading .env file: %v", err)
+	}
+
 	supabaseURL = os.Getenv("SUPABASE_URL")
 	supabaseKey = os.Getenv("SUPABASE_KEY")
+	email := os.Getenv("USER_EMAIL")
+	password := os.Getenv("USER_PASSWORD")
 
-	user, err := signIn(os.Getenv("USER_EMAIL"), os.Getenv("USER_PASSWORD"))
+	if supabaseURL == "" || supabaseKey == "" || email == "" || password == "" {
+		return fmt.Errorf("required environment variables are missing")
+	}
+
+	user, err := signIn(email, password)
 	if err != nil {
-		log.Fatal("Auth failed:", err)
+		return fmt.Errorf("auth failed: %v", err)
 	}
 	authToken = user.AccessToken
-	log.Printf("Authenticated as user %s\n", user.User.ID)
+	log.Printf("Authenticated as user %s", user.User.ID)
 
 	deviceName := getHostname()
 
 	// ensure a row exists for this device
 	if err := createDevice(user.User.ID, deviceName); err != nil {
-		log.Fatalf("failed to create device row: %v", err)
+		return fmt.Errorf("failed to create device row: %v", err)
 	}
 
-	go updateDeviceStatus(user.User.ID, deviceName)
-	listenForShutdownRequests(user.User.ID, deviceName)
+	// Create error channel for goroutines
+	errChan := make(chan error, 2)
+
+	// Start status updater
+	go func() {
+		errChan <- updateDeviceStatus(user.User.ID, deviceName)
+	}()
+
+	// Start shutdown listener
+	go func() {
+		errChan <- listenForShutdownRequests(user.User.ID, deviceName)
+	}()
+
+	// Wait for any error
+	return <-errChan
 }
 
 // signIn calls Supabase Auth REST API to get an access token
@@ -101,21 +138,24 @@ func signIn(email, password string) (*AuthResponse, error) {
 }
 
 // updateDeviceStatus periodically PATCHes status="on"
-func updateDeviceStatus(userID, name string) {
+func updateDeviceStatus(userID, name string) error {
 	ticker := time.NewTicker(StatusUpdateInterval)
 	defer ticker.Stop()
 	for {
-		patchDevice(userID, name, map[string]interface{}{
+		now := time.Now().UTC().Format(time.RFC3339)
+		if err := patchDevice(userID, name, map[string]interface{}{
 			"status":          "on",
-			"last_seen":       time.Now().UTC(),
-			"first_online_at": time.Now().UTC(),
-		})
+			"last_seen":       now,
+			"first_online_at": now,
+		}); err != nil {
+			return fmt.Errorf("failed to update device status: %v", err)
+		}
 		<-ticker.C
 	}
 }
 
 // listenForShutdownRequests polls for pending shutdown requests
-func listenForShutdownRequests(userID, name string) {
+func listenForShutdownRequests(userID, name string) error {
 	for {
 		devices, err := fetchDevices(userID, name)
 		if err != nil {
@@ -176,27 +216,38 @@ func fetchDevices(userID, name string) ([]Device, error) {
 
 // createDevice does a POST /rest/v1/devices
 func createDevice(userID, name string) error {
+	// First check if device exists
+	devices, err := fetchDevices(userID, name)
+	if err != nil {
+		return fmt.Errorf("failed to check existing device: %v", err)
+	}
+	if len(devices) > 0 {
+		// Device exists, no need to create
+		return nil
+	}
+
 	url := supabaseURL + "/rest/v1/devices"
 	payload := map[string]interface{}{
 		"user_id":         userID,
 		"name":            name,
 		"status":          "unknown",
-		"first_online_at": time.Now().UTC(),
-		"last_seen":       time.Now().UTC(),
+		"first_online_at": time.Now().UTC().Format(time.RFC3339),
+		"last_seen":       time.Now().UTC().Format(time.RFC3339),
 	}
-	body, _ := json.Marshal([]interface{}{payload})
+	// Send as single object, not array
+	body, _ := json.Marshal(payload)
 	req, _ := http.NewRequest("POST", url, bytes.NewReader(body))
 	req.Header.Set("apikey", supabaseKey)
 	req.Header.Set("Authorization", "Bearer "+authToken)
 	req.Header.Set("Content-Type", "application/json")
-	// merge-duplicates on unique constraint (user_id,name)
-	req.Header.Set("Prefer", "resolution=merge-duplicates")
+	req.Header.Set("Prefer", "return=minimal")
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("createDevice status %d: %s", resp.StatusCode, b)
@@ -205,7 +256,7 @@ func createDevice(userID, name string) error {
 }
 
 // patchDevice PATCHes; on 404 retry createDevice once
-func patchDevice(userID, name string, data map[string]interface{}) {
+func patchDevice(userID, name string, data map[string]interface{}) error {
 	url := supabaseURL + "/rest/v1/devices?user_id=eq." + userID +
 		"&name=eq." + name
 	body, _ := json.Marshal(data)
@@ -218,7 +269,7 @@ func patchDevice(userID, name string, data map[string]interface{}) {
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		log.Println("PATCH error:", err)
-		return
+		return err
 	}
 	defer resp.Body.Close()
 
@@ -228,48 +279,89 @@ func patchDevice(userID, name string, data map[string]interface{}) {
 		if len(devices) == 0 {
 			if err := createDevice(userID, name); err != nil {
 				log.Println("createDevice:", err)
-				return
+				return err
 			}
 		}
 		// now you know a row exists, so just patch:
 		patchDevice(userID, name, data)
-		return
+		return nil
 	}
 
 	if resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(resp.Body)
-		log.Printf("PATCH status %d: %s", resp.StatusCode, b)
-	} else {
-		log.Printf("PATCH succeeded for %q: %v", name, data)
+		return fmt.Errorf("PATCH status %d: %s", resp.StatusCode, b)
 	}
+	log.Printf("PATCH succeeded for %q: %v", name, data)
+	return nil
 }
 
 // handleShutdown applies logic, marks status, then shuts down
 func handleShutdown(userID, name string, dev *Device, req map[string]interface{}) {
-	if exp, ok := req["expires_at"].(float64); ok {
-		if time.Now().Unix() > int64(exp) {
-			patchDevice(userID, name, map[string]interface{}{"shutdown_requested": map[string]string{"status": "expired"}})
-			return
-		}
-	}
-	if dev.FirstOnlineAt != nil && time.Since(*dev.FirstOnlineAt) < MinUptimeBeforeShutdown {
-		return
-	}
-	patchDevice(userID, name, map[string]interface{}{"shutdown_requested": map[string]string{"status": "done"}})
-	log.Println("Shutting down…")
-	time.Sleep(ShutdownDelay)
+    // Parse expires_at from ISO string instead of float64
+    if expiresStr, ok := req["expires_at"].(string); ok {
+        expiresAt, err := time.Parse(time.RFC3339, expiresStr)
+        if err != nil {
+            log.Printf("Failed to parse expires_at: %v", err)
+            return
+        }
+        if time.Now().UTC().After(expiresAt) {
+            patchDevice(userID, name, map[string]interface{}{
+                "shutdown_requested": map[string]string{"status": "expired"},
+            })
+            return
+        }
+    }
 
-	// Execute shutdown command based on the OS
-	switch os := runtime.GOOS; os {
-	case "windows":
-		exec.Command("shutdown", "/s", "/t", "0").Run() // Windows shutdown
-	case "linux":
-		exec.Command("shutdown", "now").Run() // Linux shutdown
-	case "darwin":
-		exec.Command("osascript", "-e", "tell application \"System Events\" to shut down").Run() // macOS shutdown
-	default:
-		log.Printf("Unsupported OS: %s. Shutdown command not executed.", os)
-	}
+    // Rest of the function remains same
+    if dev.FirstOnlineAt != nil && time.Since(*dev.FirstOnlineAt) < MinUptimeBeforeShutdown {
+        log.Printf("Device %s too recently started, skipping shutdown", name)
+        return
+    }
+
+    log.Println("Shutting down…")
+    patchDevice(userID, name, map[string]interface{}{
+        "shutdown_requested": map[string]string{"status": "shutting_down"},
+        "status":            "off",
+        "last_seen":        time.Now().UTC().Format(time.RFC3339),
+    })
+    time.Sleep(ShutdownDelay)
+
+    // Execute shutdown command based on the OS
+    var cmd *exec.Cmd
+    switch os := runtime.GOOS; os {
+    case "windows":
+        cmd = exec.Command("shutdown", "/s", "/t", "0")
+    case "linux":
+        // Try systemd's loginctl first, then regular shutdown
+	
+			cmd = exec.Command("shutdown", "-h", "now")
+	
+    case "darwin":
+        cmd = exec.Command("osascript", "-e", 
+			"tell application \"System Events\" to shut down")
+    default:
+        log.Printf("Unsupported OS: %s. Shutdown command not executed.", os)
+        return
+    }
+
+    // Execute with error logging
+    if out, err := cmd.CombinedOutput(); err != nil {
+        log.Printf("Shutdown command failed: %v\nOutput: %s", err, out)
+        patchDevice(userID, name, map[string]interface{}{
+            "shutdown_requested": map[string]string{
+                "status": "failed",
+                "error": err.Error(),
+            },
+        })
+        return
+    }
+
+    // Final status update before shutdown
+    patchDevice(userID, name, map[string]interface{}{
+        "shutdown_requested": map[string]string{"status": "done"},
+        "status": "off",
+    })
+    log.Println("Shutdown command executed successfully")
 }
 
 // getHostname wraps os.Hostname
