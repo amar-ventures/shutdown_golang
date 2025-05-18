@@ -334,7 +334,7 @@ func handleShutdown(userID, name string, dev *Device, req map[string]interface{}
     case "linux":
         // Try systemd's loginctl first, then regular shutdown
 	
-			cmd = exec.Command("shutdown", "-h", "now")
+		cmd = exec.Command("systemctl", "poweroff")
 	
     case "darwin":
         cmd = exec.Command("osascript", "-e", 

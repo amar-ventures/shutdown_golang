@@ -19,7 +19,6 @@ cp "$ENV_FILE" "$INSTALL_DIR/"
 chmod +x "$INSTALL_DIR/$BINARY_NAME"
 
 # Create systemd service file
-# Create systemd service file
 SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME"
 echo "Creating systemd service file at $SERVICE_FILE..."
 sudo bash -c "cat > $SERVICE_FILE" <<EOL
@@ -30,23 +29,33 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# run as root so we can poweroff
+User=root
+# load your .env
+EnvironmentFile=$INSTALL_DIR/$ENV_FILE
 ExecStart=$INSTALL_DIR/$BINARY_NAME
 WorkingDirectory=$INSTALL_DIR
-User=$USER
+
+# allow poweroff
+AmbientCapabilities=CAP_SYS_BOOT
+CapabilityBoundingSet=CAP_SYS_BOOT
+NoNewPrivileges=no
+
+# log to journal
+SyslogIdentifier=shutdown_golang
+StandardOutput=journal
+StandardError=journal
+
 Restart=on-failure
-RestartSec=30
-StandardOutput=append:/var/log/shutdown_golang.log
-StandardError=append:/var/log/shutdown_golang.log
+RestartSec=30s
 
 [Install]
 WantedBy=multi-user.target
 EOL
 
-# Reload systemd, enable and start the service
-echo "Reloading systemd, enabling, and starting the service..."
 sudo systemctl daemon-reload
 sudo systemctl enable "$SERVICE_NAME"
-sudo systemctl start "$SERVICE_NAME"
+sudo systemctl restart "$SERVICE_NAME"
 
 # Check service status
 echo "Checking service status..."
